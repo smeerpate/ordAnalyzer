@@ -440,6 +440,23 @@ class OrdViewer:
         self._fit_pending = True
         self.root.after(50, self.fit_to_screen)
 
+        # ── Controleer op bijbehorend .sta-bestand ────────────────────────
+        sta_path = os.path.splitext(path)[0] + '.sta'
+        if os.path.isfile(sta_path):
+            sta_name = os.path.basename(sta_path)
+            if messagebox.askyesno(
+                'STA-bestand gevonden',
+                f'Er staat een STA-bestand naast dit ORD-bestand:\n\n'
+                f'  {sta_name}\n\n'
+                f'Wil je dit verwijderen?',
+                icon='question'
+            ):
+                try:
+                    os.remove(sta_path)
+                    messagebox.showinfo('Verwijderd', f'{sta_name} is verwijderd.')
+                except OSError as e:
+                    messagebox.showerror('Fout', f'Kon {sta_name} niet verwijderen:\n{e}')
+
     # ------------------------------------------------------------------
     # Geometrische hulpfuncties voor conflictcoördinaten
     # ------------------------------------------------------------------
