@@ -100,6 +100,8 @@ class Contour:
     area:     float                          = field(init=False)
     centroid: Tuple[float, float]            = field(init=False)
     bbox:     Tuple[float, float, float, float] = field(init=False)
+    first_data_row: int = field(default=-1, init=False)  # eerste rij in _raw_data
+    last_data_row:  int = field(default=-1, init=False)  # laatste rij in _raw_data
 
     def __post_init__(self):
         pts = self.points
@@ -235,10 +237,14 @@ class OrdProcessor:
 
         self.header:  str = ""
         self.version: str = ""
-        self._raw_data: List[List[str]] = []
+        self._raw_data:  List[List[str]] = []
+        self._raw_lines: List[str]       = []  # parallelle lijst met originele regeltekst
 
-        self.contours: List[Contour] = []
-        self.rapids:   List[List[Tuple[float, float]]] = []
+        self.contours:      List[Contour] = []
+        self.rapids:          List[List[Tuple[float, float]]] = []  # alle rapids
+        self._intra_rapids:   List[List[Tuple[float, float]]] = []  # binnen onderdeel
+        self._inter_rapids:   List[List[Tuple[float, float]]] = []  # tussen onderdelen
+        self._rapid_start_rows: List[int] = []  # startrow in _raw_data per rapid
         self.parts:    List[OrdPart] = []
         self.no_safety_height:   bool = False  # True als alle Z-waarden 0 zijn
         self.has_negative_z:     bool = False  # True als er Z < 0 in het bestand staat
@@ -255,6 +261,7 @@ class OrdProcessor:
         self._extract_contours()
         self._classify_contours()
         self._group_into_parts()
+        self._classify_rapids()
         self._parsed = True
         return self
 
@@ -495,6 +502,7 @@ class OrdProcessor:
             flds = [v.strip() for v in line.split(",")]
             if len(flds) >= 7:
                 self._raw_data.append(flds)
+                self._raw_lines.append(line.strip())
 
         # ── Z-coördinaat controles (kolom 3, index 2) ──────────────────
         z_vals = [float(r[2]) for r in self._raw_data]
@@ -533,16 +541,24 @@ class OrdProcessor:
         self.contours = []
         self.rapids   = []
 
-        cur_segments: List[CutSegment] = []
-        cur_rapid:    List[Tuple[float, float]] = []
-        contour_idx = 0
+        cur_segments:       List[CutSegment] = []
+        cur_rapid:          List[Tuple[float, float]] = []
+        cur_rapid_first_row: int = -1
+        contour_idx   = 0
+        cur_first_row: int = -1
+        cur_last_row:  int = -1
 
         def flush_contour():
-            nonlocal cur_segments, contour_idx
+            nonlocal cur_segments, contour_idx, cur_first_row, cur_last_row
             if cur_segments:
-                self.contours.append(Contour(contour_idx, cur_segments[:]))
+                c = Contour(contour_idx, cur_segments[:])
+                c.first_data_row = cur_first_row
+                c.last_data_row  = cur_last_row
+                self.contours.append(c)
                 contour_idx += 1
-            cur_segments = []
+            cur_segments  = []
+            cur_first_row = -1
+            cur_last_row  = -1
 
         def flush_rapid(keep_if_short: bool = False) -> bool:
             """
@@ -550,16 +566,21 @@ class OrdProcessor:
             Geeft True terug als de rapid kort genoeg is om de contour
             NIET te splitsen (intra-contour rapid).
             """
-            nonlocal cur_rapid
+            nonlocal cur_rapid, cur_rapid_first_row
             if len(cur_rapid) < 2:
                 cur_rapid = []
+                cur_rapid_first_row = -1
                 return False
             dx = cur_rapid[-1][0] - cur_rapid[0][0]
             dy = cur_rapid[-1][1] - cur_rapid[0][1]
             length = math.hypot(dx, dy)
             is_short = length < self.tab_threshold_mm
             self.rapids.append(cur_rapid)
+            self._rapid_start_rows.append(
+                cur_rapid_first_row if cur_rapid_first_row >= 0 else 0
+            )
             cur_rapid = []
+            cur_rapid_first_row = -1
             return is_short
 
         data = self._raw_data
@@ -582,6 +603,7 @@ class OrdProcessor:
             if is_rapid:
                 if not cur_rapid:
                     cur_rapid = [(x0, y0), (x1, y1)]
+                    cur_rapid_first_row = i
                 else:
                     cur_rapid.append((x1, y1))
             else:
@@ -595,6 +617,9 @@ class OrdProcessor:
                     arc   = int(f4)
                 except ValueError:
                     feed_code, arc = 0, 0
+                if cur_first_row < 0:
+                    cur_first_row = i
+                cur_last_row = i
                 cur_segments.append(CutSegment(
                     start=(x0, y0),
                     end=(x1, y1),
@@ -677,6 +702,189 @@ class OrdProcessor:
                     if _point_in_polygon(hx, hy, outer.points):
                         part.holes.append(hole)
             self.parts.append(part)
+
+
+    def reorder_parts(self, new_order: List[int],
+                      traverse_z_mm: float = 0.0) -> str:
+        """
+        Genereer ORD-bestandsinhoud met de parts in de opgegeven volgorde.
+
+        Elke part wordt behandeld als een aaneengesloten tekstblok
+        (van eerste snijregel tot laatste snijregel). De rapids tussen
+        blokken worden opnieuw berekend, inclusief een optionele
+        traverse-hoogte (in mm).
+
+        Parameters
+        ----------
+        new_order      : originele part-indices in de gewenste snijvolgorde.
+        traverse_z_mm  : veilige reishoogte in mm tussen bewerkingen (0 = vlak).
+        """
+        self._ensure_parsed()
+
+        traverse_z_inch = traverse_z_mm / INCH_TO_MM
+
+        # ── Rij-bereik per ORIGINELE part-index ──────────────────────────────
+        # Gebruik part_index als sleutel zodat de mapping correct blijft
+        # ook na visuele herordening in de viewer.
+        def part_rows(p):
+            all_c = p.outer_contours + p.holes
+            if not all_c or any(c.first_data_row < 0 for c in all_c):
+                return None, None
+            return (min(c.first_data_row for c in all_c),
+                    max(c.last_data_row  for c in all_c))
+
+        ranges = {}          # orig_part_index → (first_row, last_row)
+        for p in self.parts:
+            ranges[p.part_index] = part_rows(p)
+
+        # ── Preamble: rijen vóór het eerste snijblok ──────────────────────────
+        valid_firsts = [fr for fr, _ in ranges.values() if fr is not None]
+        first_fr = min(valid_firsts) if valid_firsts else 0
+
+        out = [self.header, self.version]
+        for i in range(first_fr):
+            out.append(self._raw_lines[i])
+
+        # ── Hulpfunctie: genereer rapid-blok van (x0,y0) naar (x1,y1) ───────
+        def rapid_lines(x0, y0, x1, y1) -> List[str]:
+            """
+            Genereer de verbindende rapid-regels van eindpunt naar startpunt.
+            Elke rij heeft formaat: x, y, z, 0, 0, 0, 0
+            Met traverse_z_inch > 0:
+              1. Hef op naar traverse-hoogte boven eindpunt
+              2. Beweeg horizontaal naar startpunt (op traverse-hoogte)
+              (de eerste snijrij van het volgende blok heeft Z=0,
+               wat automatisch het neerlaten verzorgt)
+            Met traverse_z_inch = 0:
+              1. Directe horizontal rapid (één rij)
+            """
+            def fmt(x, y, z):
+                return f"   {x:10.4f},  {y:10.4f},  {z:10.4f}, 0,    0, 0, 0"
+
+            if traverse_z_inch > 0:
+                return [
+                    fmt(x0, y0, 0.0),             # eindpunt op snijhoogte
+                    fmt(x0, y0, traverse_z_inch),  # omhoog naar travershoogte
+                    fmt(x1, y1, traverse_z_inch),  # horizontaal naar startpunt
+                    # de eerste snijrij van het volgende blok (Z=0) verzorgt
+                    # het neerlaten impliciet
+                ]
+            else:
+                return [fmt(x0, y0, 0.0)]
+
+        # ── Blokken in nieuwe volgorde emitteren ─────────────────────────────
+        prev_ep: tuple | None = None   # (x, y) eindpunt vorig blok (in inch)
+
+        for part_idx in new_order:
+            fr, lr = ranges.get(part_idx, (None, None))
+            if fr is None:
+                continue
+
+            ep_idx = lr + 1   # rij na laatste snijrij = eindpositie
+
+            # Bepaal start- en eindpositie van dit blok (in inch)
+            part_start_x = float(self._raw_data[fr][0])
+            part_start_y = float(self._raw_data[fr][1])
+
+            if ep_idx < len(self._raw_data):
+                ep_x = float(self._raw_data[ep_idx][0])
+                ep_y = float(self._raw_data[ep_idx][1])
+            else:
+                # Geen eindpositierij → gebruik startpositie als noodoplossing
+                ep_x, ep_y = part_start_x, part_start_y
+
+            # Verbindende rapid (niet vóór het allereerste blok)
+            if prev_ep is not None:
+                for line in rapid_lines(prev_ep[0], prev_ep[1],
+                                        part_start_x, part_start_y):
+                    out.append(line)
+
+            # Snijrijen van dit blok (fr t/m lr)
+            for i in range(fr, lr + 1):
+                out.append(self._raw_lines[i])
+
+            prev_ep = (ep_x, ep_y)
+
+        # ── Sluitende rij: eindpositie van het laatste blok ──────────────────
+        if prev_ep is not None:
+            out.append(
+                f"   {prev_ep[0]:10.4f},  {prev_ep[1]:10.4f},  {0.0:10.4f}, 0,    0, 0, 0"
+            )
+
+        # ── Trailer: rijen na het origineel laatste blok ─────────────────────
+        valid_lasts = [lr for _, lr in ranges.values() if lr is not None]
+        if valid_lasts:
+            orig_last_ep = max(valid_lasts) + 1
+            for i in range(orig_last_ep + 1, len(self._raw_lines)):
+                out.append(self._raw_lines[i])
+
+        return "\n".join(out) + "\n"
+
+    def save(self, filepath: str,
+             new_order: List[int] | None = None,
+             traverse_z_mm: float = 0.0) -> None:
+        """Schrijf het (her)geordende ORD-bestand naar schijf."""
+        if new_order is None:
+            new_order = list(range(len(self.parts)))
+        content = self.reorder_parts(new_order, traverse_z_mm=traverse_z_mm)
+        with open(filepath, "w", newline="\n") as fh:
+            fh.write(content)
+
+    def _classify_rapids(self):
+        """
+        Verdeel self.rapids in _intra_rapids en _inter_rapids.
+
+        Een rapid is intra-part als zijn startrow valt binnen het
+        aaneengesloten rijbereik [first_data_row, last_data_row] van
+        een OrdPart (inclusief alle tussenliggende rapids van dat part,
+        bv. tussen outer-contour en gaten).
+
+        Een rapid is inter-part als zijn startrow buiten alle part-
+        rijbereiken valt.
+        """
+        # Rijbereik per part: van eerste snijrij t/m laatste snijrij
+        # Alle intra-part rapids (ook outer→gat) vallen per definitie
+        # BINNEN dit bereik.
+        part_ranges = []
+        for part in self.parts:
+            all_c = part.outer_contours + part.holes
+            if not all_c:
+                continue
+            fr = min(c.first_data_row for c in all_c)
+            lr = max(c.last_data_row  for c in all_c)
+            part_ranges.append((fr, lr))
+
+        self._intra_rapids = []
+        self._inter_rapids = []
+
+        for rapid, start_row in zip(self.rapids, self._rapid_start_rows):
+            is_intra = any(fr <= start_row <= lr for fr, lr in part_ranges)
+            if is_intra:
+                self._intra_rapids.append(rapid)
+            else:
+                self._inter_rapids.append(rapid)
+
+    def detect_traverse_z_mm(self) -> float:
+        """
+        Lees de hoogste Z-waarde uit de inter-part rapid rijen in _raw_data.
+        Inter-part rapid rijen: F4=0, F5=0, F6=0.
+        Geeft de waarde in mm terug (raw data staat in inch).
+        Geeft 0.0 terug als er geen traverse-hoogte gevonden wordt.
+        """
+        self._ensure_parsed()
+        max_z_inch = 0.0
+        for row in self._raw_data:
+            try:
+                f4 = row[3].strip()
+                f5 = row[4].strip()
+                f6 = row[5].strip()
+                if f4 == '0' and f5 == '0' and f6 == '0':
+                    z = float(row[2])
+                    if z > max_z_inch:
+                        max_z_inch = z
+            except (IndexError, ValueError):
+                continue
+        return max_z_inch * INCH_TO_MM
 
     def _ensure_parsed(self):
         if not self._parsed:

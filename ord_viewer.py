@@ -21,6 +21,65 @@ import math
 
 from ord_processor import OrdProcessor, SegmentConflict
 
+
+# ---------------------------------------------------------------------------
+# Tooltip
+# ---------------------------------------------------------------------------
+
+class _Tooltip:
+    """Kleine popup-uitleg bij hover over een widget."""
+
+    def __init__(self, widget: tk.Widget, text: str, delay: int = 500):
+        self._widget = widget
+        self._text   = text
+        self._delay  = delay
+        self._id     = None
+        self._win: tk.Toplevel | None = None
+        widget.bind('<Enter>', self._schedule)
+        widget.bind('<Leave>', self._cancel)
+        widget.bind('<ButtonPress>', self._cancel)
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._id = self._widget.after(self._delay, self._show)
+
+    def _cancel(self, _event=None):
+        if self._id:
+            self._widget.after_cancel(self._id)
+            self._id = None
+        if self._win:
+            self._win.destroy()
+            self._win = None
+
+    def _show(self):
+        if self._win:
+            return
+        x = self._widget.winfo_rootx() + 4
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._win = tk.Toplevel(self._widget)
+        self._win.wm_overrideredirect(True)
+        self._win.wm_geometry(f'+{x}+{y}')
+        lbl = tk.Label(
+            self._win,
+            text=self._text,
+            bg='#1E1E3A', fg='#C8C8E8',
+            font=('Segoe UI', 8),
+            relief=tk.FLAT, bd=0,
+            padx=8, pady=5,
+            justify=tk.LEFT,
+            wraplength=280,
+        )
+        lbl.pack()
+        # Subtiele rand
+        self._win.configure(bg='#3A3A60')
+        self._win.wm_attributes('-topmost', True)
+
+
+def tooltip(widget: tk.Widget, text: str) -> '_Tooltip':
+    """Helper: koppel een tooltip aan een widget en geef de widget terug."""
+    _Tooltip(widget, text)
+    return widget
+
 # ---------------------------------------------------------------------------
 # Kleurenthema
 # ---------------------------------------------------------------------------
@@ -101,9 +160,12 @@ class OrdViewer:
         self._off_x: float = 0.0
         self._off_y: float = 0.0
 
-        self._pan_last: tuple | None = None
+        self._pan_last:   tuple | None = None
+        self._press_pos:  tuple | None = None   # voor klik-vs-sleep detectie
         self._fit_pending: bool = False
-        self._conflicts: list = []   # SegmentConflict objecten + positie (mm)
+        self._conflicts:  list = []   # SegmentConflict objecten + positie (mm)
+        self._sel_part:   int | None = None    # index in processor.parts
+        self._dirty:      bool = False          # herordening nog niet opgeslagen
 
         self._build_ui()
         self._bind_events()
@@ -126,16 +188,73 @@ class OrdViewer:
             b.bind('<Leave>', lambda e: b.config(bg=C['btn_bg']))
             return b
 
-        btn(tb, '📂  Open', self.open_file).pack(side=tk.LEFT, padx=(8, 2))
+        tooltip(btn(tb, '📂  Open', self.open_file),
+            'Bestand openen\n'
+            'Opent een .ord bestand via een bestandskiezer.'
+        ).pack(side=tk.LEFT, padx=(8, 2))
         tk.Frame(tb, bg='#303060', width=1).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=2)
-        btn(tb, '＋  Zoom in',  lambda: self._zoom_center(1.25)).pack(side=tk.LEFT, padx=2)
-        btn(tb, '－  Zoom uit', lambda: self._zoom_center(0.80)).pack(side=tk.LEFT, padx=2)
-        btn(tb, '⤢  Fit',      self.fit_to_screen).pack(side=tk.LEFT, padx=2)
+        tooltip(btn(tb, '＋  Zoom in',  lambda: self._zoom_center(1.25)),
+            'Zoom in (25%)\n'
+            'Ook: muiswiel omhoog.'
+        ).pack(side=tk.LEFT, padx=2)
+        tooltip(btn(tb, '－  Zoom uit', lambda: self._zoom_center(0.80)),
+            'Zoom uit (20%)\n'
+            'Ook: muiswiel omlaag.'
+        ).pack(side=tk.LEFT, padx=2)
+        tooltip(btn(tb, '⤢  Fit',      self.fit_to_screen),
+            'Alles in beeld\n'
+            'Schaalt en centreert het volledige snijplan.\n'
+            'Ook: dubbelklik op de tekening.'
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Frame(tb, bg='#303060', width=1).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=2)
+        self._btn_swap = tooltip(
+            btn(tb, '⇄  Wissel', self._toggle_swap_mode),
+            'Snijvolgorde wisselen\n'
+            'Klik op een onderdeel in de tekening om het te selecteren (geel gemarkeerd).\n'
+            'Klik daarna op een tweede onderdeel\n'
+            'om de snijvolgorde van beide te wisselen.\n'
+            'Klik nogmaals op hetzelfde onderdeel of op ⇄ om de selectie te wissen.'
+        )
+        self._btn_swap.pack(side=tk.LEFT, padx=2)
+        self._btn_save = tooltip(
+            btn(tb, '💾  Opslaan', self.save_file),
+            'Opslaan\n'
+            'Sla het ORD-bestand op met de nieuwe snijvolgorde.\n'
+            'De originele coördinaten blijven ongewijzigd;\n'
+            'alleen de volgorde van de onderdelen verandert.'
+        )
+        self._btn_save.pack(side=tk.LEFT, padx=2)
 
         self._lbl_file = tk.Label(tb, text='Geen bestand geladen',
                                    bg=C['toolbar_bg'], fg=C['text_dim'],
                                    font=('Segoe UI', 9))
         self._lbl_file.pack(side=tk.LEFT, padx=16)
+
+        # ℹ bediening-hint rechts in toolbar
+        tooltip(
+            tk.Label(tb, text='ℹ',
+                     bg=C['toolbar_bg'], fg=C['text_dim'],
+                     font=('Segoe UI', 11), cursor='question_arrow'),
+            'Bediening canvas\n'
+            '  Slepen (links/midden)  Pannen\n'
+            '  Muiswiel               Zoomen op cursor\n'
+            '  Dubbelklik             Alles in beeld\n'
+            '\n'
+            'Kleuren\n'
+            '  Groen gestippeld       Rapid traverse (geen snijden)\n'
+            '  Paars → wit heatmap    Snijsnelheid (laag → hoog)\n'
+            '\n'
+            'Nummers in cirkel        Snijvolgorde per onderdeel\n'
+            '\n'
+            'Waarschuwingen (zijpaneel)\n'
+            '  ⚠ Geen safety hoogte   Alle Z-waarden zijn 0\n'
+            '  ⚠ Negatieve Z           Z < 0 aanwezig\n'
+            '  ⚠ Snijden niet op Z=0  Snijbewegingen op Z ≠ 0\n'
+            '\n'
+            'Conflicten (zijpaneel)\n'
+            '  ⚠ geel                 Overlappende snijlijnen\n'
+            '  ✕ rood                 Kruisende snijlijnen'
+        ).pack(side=tk.RIGHT, padx=12)
 
         # ---- Hoofd-gebied: canvas + paneel ----
         main = tk.Frame(self.root, bg=C['bg'])
@@ -207,6 +326,11 @@ class OrdViewer:
                                      font=('Consolas', 8))
         self._lbl_coords.pack(side=tk.LEFT, padx=12)
 
+        self._lbl_sel = tk.Label(sb, text='',
+                                  bg=C['status_bg'], fg='#FACC15',
+                                  font=('Segoe UI', 8))
+        self._lbl_sel.pack(side=tk.LEFT, padx=12)
+
         # Legende: rapid + heatmap gradient
         leg = tk.Frame(sb, bg=C['status_bg'])
         leg.pack(side=tk.RIGHT, padx=16)
@@ -256,8 +380,8 @@ class OrdViewer:
         self._do_zoom(factor, event.x, event.y)
 
     def _on_pan_start(self, event):
-        self._pan_last = (event.x, event.y)
-        self._canvas.config(cursor='fleur')
+        self._pan_last  = (event.x, event.y)
+        self._press_pos = (event.x, event.y)
 
     def _on_pan_move(self, event):
         if self._pan_last:
@@ -267,7 +391,13 @@ class OrdViewer:
             self._redraw()
 
     def _on_pan_end(self, event):
-        self._pan_last = None
+        if self._press_pos:
+            dx = event.x - self._press_pos[0]
+            dy = event.y - self._press_pos[1]
+            if abs(dx) <= 4 and abs(dy) <= 4:
+                self._on_canvas_click(event.x, event.y)
+        self._pan_last  = None
+        self._press_pos = None
         self._canvas.config(cursor='crosshair')
 
     def _on_mouse_move(self, event):
@@ -305,6 +435,7 @@ class OrdViewer:
 
         self.root.title(f'ORD Viewer — {os.path.basename(path)}')
         self._lbl_file.config(text=os.path.basename(path), fg=C['text_bright'])
+        _Tooltip(self._lbl_file, path)  # volledig pad als tooltip
         self._update_info_panel()
         self._fit_pending = True
         self.root.after(50, self.fit_to_screen)
@@ -483,6 +614,250 @@ class OrdViewer:
             ).pack(anchor=tk.W, padx=10, pady=bot_pad)
 
         self._warn_frame.pack(fill=tk.X, padx=8, pady=(4, 2))
+
+    # ------------------------------------------------------------------
+    # Volgorde-wissel
+    # ------------------------------------------------------------------
+
+    def _toggle_swap_mode(self):
+        """Zet wissel-modus aan/uit."""
+        if self._sel_part is not None:
+            self._sel_part = None
+            self._update_swap_status()
+            self._redraw()
+        # Modus is impliciet: zolang er een selectie is, zitten we in wissel-modus.
+        # Gebruiker klikt op een part om te selecteren; tweede klik wisselt.
+
+    def _on_canvas_click(self, px: int, py: int):
+        """Verwerk een klik op het canvas voor part-selectie en -wissel."""
+        if not self.processor:
+            return
+        xmm, ymm = self._to_world(px, py)
+        hit = self._hit_part(xmm, ymm)
+
+        if hit is None:
+            # Klik in lege ruimte → deselecteer
+            self._sel_part = None
+            self._update_swap_status()
+            self._redraw()
+            return
+
+        if self._sel_part is None:
+            # Eerste selectie
+            self._sel_part = hit
+            self._update_swap_status()
+            self._redraw()
+            return
+
+        if self._sel_part == hit:
+            # Zelfde part nogmaals klikken → deselecteer
+            self._sel_part = None
+            self._update_swap_status()
+            self._redraw()
+            return
+
+        # Twee verschillende parts geselecteerd → probeer te wisselen
+        self._try_swap(self._sel_part, hit)
+
+    def _hit_part(self, xmm: float, ymm: float) -> 'int | None':
+        """Geeft de index in processor.parts terug van het part onder (xmm, ymm)."""
+        if not self.processor:
+            return None
+        for idx, part in enumerate(self.processor.parts):
+            for c in part.outer_contours:
+                bx0, bx1, by0, by1 = c.bbox
+                if bx0 <= xmm <= bx1 and by0 <= ymm <= by1:
+                    from ord_processor import _point_in_polygon
+                    if _point_in_polygon(xmm, ymm, c.points):
+                        return idx
+        return None
+
+    def _can_swap(self, idx_a: int, idx_b: int) -> bool:
+        """Twee parts kunnen altijd van volgorde wisselen."""
+        return True
+
+    def _rebuild_display_rapids(self):
+        """
+        Herbereken de rapids voor de weergave op basis van de huidige snijvolgorde.
+
+        Intra-part rapids (korte verbindingen binnen een onderdeel) blijven
+        ongewijzigd. De inter-part rapids (lange verplaatsingen tussen onderdelen)
+        worden opnieuw gegenereerd als rechte lijnen van het eindpunt van het
+        vorige onderdeel naar het startpunt van het volgende.
+        """
+        p = self.processor
+        if not p:
+            return
+
+        INCH_TO_MM = 25.4
+
+        # Intra-part rapids: direct uit de parser, geen afstand-filter nodig
+        intra = list(p._intra_rapids)
+
+
+        # Inter-part rapids: herberekenen op basis van huidige volgorde
+        inter = []
+        for i in range(len(p.parts) - 1):
+            pa = p.parts[i]
+            pb = p.parts[i + 1]
+
+            # Eindpunt van pa (positie na de laatste snijrij)
+            all_c_a = pa.outer_contours + pa.holes
+            if not all_c_a:
+                continue
+            lr_a   = max(c.last_data_row for c in all_c_a)
+            ep_idx = lr_a + 1
+            if ep_idx >= len(p._raw_data):
+                continue
+            r    = p._raw_data[ep_idx]
+            ep_a = (float(r[0]) * INCH_TO_MM, float(r[1]) * INCH_TO_MM)
+
+            # Startpunt van pb (eerste snijrij)
+            all_c_b = pb.outer_contours + pb.holes
+            if not all_c_b:
+                continue
+            fr_b = min(c.first_data_row for c in all_c_b)
+            r    = p._raw_data[fr_b]
+            sp_b = (float(r[0]) * INCH_TO_MM, float(r[1]) * INCH_TO_MM)
+
+            inter.append([ep_a, sp_b])
+
+        p.rapids = intra + inter
+
+    def _try_swap(self, idx_a: int, idx_b: int):
+        """Wissel de snijvolgorde van twee parts als hun bbox gelijk is."""
+        # Wissel in de lijst
+        p = self.processor.parts
+        p[idx_a], p[idx_b] = p[idx_b], p[idx_a]
+        self._rebuild_display_rapids()
+        self._dirty = True
+        self._sel_part = None
+        self._update_swap_status()
+        self._redraw()
+
+    def _update_swap_status(self):
+        """Pas het selectielabel in de statusbalk aan."""
+        if self._sel_part is not None:
+            num = self.processor.parts[self._sel_part].part_index + 1
+            self._lbl_sel.config(
+                text=f'Part {num} geselecteerd — klik een ander part met gelijke bbox om te wisselen.',
+                fg='#FACC15'
+            )
+        elif self._dirty:
+            self._lbl_sel.config(
+                text='Volgorde gewijzigd — gebruik 💾 Opslaan om op te slaan.',
+                fg='#4ADE80'
+            )
+        else:
+            self._lbl_sel.config(text='', fg='#FACC15')
+
+    def save_file(self):
+        """Sla het hergeordende ORD-bestand op."""
+        if not self.processor:
+            return
+
+        # ── Traversehoogte vragen (stel bestaande hoogte voor) ───────────────
+        suggested = self.processor.detect_traverse_z_mm()
+        traverse_z = self._ask_traverse_height(default_mm=suggested)
+        if traverse_z is None:
+            return  # gebruiker heeft geannuleerd
+
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            title='ORD opslaan',
+            defaultextension='.ord',
+            filetypes=[('ORD bestanden', '*.ord'), ('Alle bestanden', '*.*')],
+            initialfile=self.processor.filename,
+        )
+        if not path:
+            return
+
+        new_order = [p.part_index for p in self.processor.parts]
+        self.processor.save(path, new_order, traverse_z_mm=traverse_z)
+        self._dirty = False
+        self._update_swap_status()
+        from tkinter import messagebox as mb
+        z_info = f', traverse {traverse_z:.1f} mm' if traverse_z > 0 else ', geen traverse (Z=0)'
+        mb.showinfo('Opgeslagen',
+                    f'Bestand opgeslagen:\n{os.path.basename(path)}{z_info}')
+
+    def _ask_traverse_height(self, default_mm: float = 0.0) -> 'float | None':
+        """
+        Vraag de traversehoogte op via een klein dialoogvenster.
+        default_mm: voorgestelde waarde (uit bestaand bestand afgeleid).
+        Geeft de hoogte in mm terug, of None als de gebruiker annuleert.
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Traversehoogte')
+        dlg.resizable(False, False)
+        dlg.configure(bg=C['bg'])
+        dlg.grab_set()
+
+        # Centreer t.o.v. hoofdvenster
+        self.root.update_idletasks()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        dlg.geometry(f'320x160+{rx + rw//2 - 160}+{ry + rh//2 - 80}')
+
+        tk.Label(dlg,
+                 text='Traversehoogte (mm)',
+                 bg=C['bg'], fg=C['text_bright'],
+                 font=('Segoe UI', 10, 'bold')).pack(pady=(18, 4))
+
+        tk.Label(dlg,
+                 text='Veilige Z-hoogte tijdens rapid traverse tussen onderdelen.\n'                      'Gebruik 0 voor vlakke verplaatsing (geen Z-beweging).',
+                 bg=C['bg'], fg=C['text_dim'],
+                 font=('Segoe UI', 8), justify=tk.CENTER).pack(pady=(0, 10))
+
+        # Formatteer: geen decimalen als de waarde een geheel getal is
+        default_str = f'{default_mm:.3f}'.rstrip('0').rstrip('.')
+        if not default_str or default_str == '-':
+            default_str = '0'
+        entry_var = tk.StringVar(value=default_str)
+        entry = tk.Entry(dlg, textvariable=entry_var,
+                         bg=C['btn_bg'], fg=C['text_bright'],
+                         insertbackground=C['text_bright'],
+                         font=('Consolas', 10), width=10, justify=tk.CENTER,
+                         relief=tk.FLAT, bd=4)
+        entry.pack()
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+
+        result = [None]
+
+        def ok(_event=None):
+            try:
+                v = float(entry_var.get().replace(',', '.'))
+                if v < 0:
+                    raise ValueError
+                result[0] = v
+                dlg.destroy()
+            except ValueError:
+                entry.config(bg='#4A1A1A')
+                entry.after(600, lambda: entry.config(bg=C['btn_bg']))
+
+        def cancel(_event=None):
+            dlg.destroy()
+
+        btn_frame = tk.Frame(dlg, bg=C['bg'])
+        btn_frame.pack(pady=10)
+
+        def mkbtn(parent, text, cmd):
+            b = tk.Label(parent, text=text, bg=C['btn_bg'], fg=C['btn_fg'],
+                         font=('Segoe UI', 9), padx=14, pady=4,
+                         cursor='hand2', relief=tk.FLAT)
+            b.bind('<Button-1>', lambda e: cmd())
+            b.bind('<Enter>', lambda e: b.config(bg=C['btn_hover']))
+            b.bind('<Leave>', lambda e: b.config(bg=C['btn_bg']))
+            return b
+
+        mkbtn(btn_frame, 'OK', ok).pack(side=tk.LEFT, padx=6)
+        mkbtn(btn_frame, 'Annuleren', cancel).pack(side=tk.LEFT, padx=6)
+        entry.bind('<Return>', ok)
+        entry.bind('<Escape>', cancel)
+
+        self.root.wait_window(dlg)
+        return result[0]
 
     def _set_conflict_text(self, parts: list):
         """Schrijf gekleurde tekst naar het conflicttekstvak."""
@@ -671,7 +1046,7 @@ class OrdViewer:
         if self._scale < 0.3:
             return
 
-        for part in self.processor.parts:
+        for idx, part in enumerate(self.processor.parts):
             # Zwaartepunt = gemiddelde van de outer-contour zwaartepunten
             outers = part.outer_contours
             if not outers:
@@ -685,22 +1060,31 @@ class OrdViewer:
             if px < -20 or px > cw + 20 or py < -20 or py > ch + 20:
                 continue
 
-            label = str(part.part_index + 1)
-            r = 9 + (len(label) - 1) * 3   # straal groeit mee met aantal cijfers
+            label = str(idx + 1)  # positie in huidige snijvolgorde
+            r = 9 + (len(label) - 1) * 3
+            is_sel = (idx == self._sel_part)
+            # Highlight ring voor geselecteerd part
+            if is_sel:
+                self._canvas.create_oval(
+                    px - r - 5, py - r - 5, px + r + 5, py + r + 5,
+                    fill='', outline='#FACC15', width=2
+                )
             # Witte rand
             self._canvas.create_oval(
                 px - r - 1, py - r - 1, px + r + 1, py + r + 1,
                 fill='#FFFFFF', outline=''
             )
-            # Donkere cirkel
+            # Donkere of gele cirkel
+            fill_col = '#2A1A00' if is_sel else '#0A0A14'
             self._canvas.create_oval(
                 px - r, py - r, px + r, py + r,
-                fill='#0A0A14', outline=''
+                fill=fill_col, outline=''
             )
             # Getal
+            text_col = '#FACC15' if is_sel else C['text_bright']
             self._canvas.create_text(
                 px, py, text=label,
-                fill=C['text_bright'],
+                fill=text_col,
                 font=('Segoe UI', 8, 'bold'),
                 anchor=tk.CENTER,
             )
