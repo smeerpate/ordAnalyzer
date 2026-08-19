@@ -864,6 +864,73 @@ class OrdProcessor:
             else:
                 self._inter_rapids.append(rapid)
 
+    def apply_cutting_speed(self, new_speed: int,
+                             part_indices: 'list[int] | None' = None):
+        """
+        Pas de snijsnelheid (F5) aan in _raw_data en _raw_lines.
+
+        new_speed     : de nieuwe F5-waarde (bv. 20, 40, 60)
+        part_indices  : lijst van part.part_index waarden die aangepast
+                        worden. None = alle snijcontouren.
+
+        Rijen met F5=0 (rapids) worden nooit aangepast.
+        """
+        self._ensure_parsed()
+
+        # Bepaal de rijbereiken die aangepast mogen worden
+        if part_indices is None:
+            # Alle rijen
+            allowed_rows = set(range(len(self._raw_data)))
+        else:
+            allowed_rows: set[int] = set()
+            idx_set = set(part_indices)
+            for part in self.parts:
+                if part.part_index not in idx_set:
+                    continue
+                for c in part.outer_contours + part.holes:
+                    if c.first_data_row >= 0:
+                        for r in range(c.first_data_row, c.last_data_row + 1):
+                            allowed_rows.add(r)
+
+        for i, row in enumerate(self._raw_data):
+            if i not in allowed_rows:
+                continue
+            try:
+                f5_val = int(row[4].strip())
+            except (IndexError, ValueError):
+                continue
+            if f5_val == 0:
+                continue  # rapid-rij, niet aanpassen
+
+            # Vervang de F5-kolom in de raw lijn
+            # Formaat: "   X,   Y,   Z, F4, F5, F6, ..."
+            # Gebruik de raw lijn als basis en vervang het F5-veld
+            old_line = self._raw_lines[i]
+            parts_line = old_line.split(',')
+            if len(parts_line) < 6:
+                continue
+            # F5 staat op positie 4 (0-gebaseerd)
+            old_f5 = parts_line[4]
+            # Behoud breedte van het veld
+            width = len(old_f5)
+            new_f5_str = f'{new_speed:>{width}}'
+            parts_line[4] = new_f5_str
+            self._raw_lines[i] = ','.join(parts_line)
+            row[4] = str(new_speed)
+
+        # Update ook de CutSegment-objecten zodat de UI direct de nieuwe
+        # kleurschakering toont zonder herparsen.
+        part_idx_set = None if part_indices is None else set(part_indices)
+        for part in self.parts:
+            if part_idx_set is not None and part.part_index not in part_idx_set:
+                continue
+            for c in part.outer_contours + part.holes:
+                for seg in c.segments:
+                    if seg.feed_code != 0:   # rapid-segmenten niet aanpassen
+                        seg.feed_code = new_speed
+
+        self._dirty_speed = True
+
     def detect_traverse_z_mm(self) -> float:
         """
         Lees de hoogste Z-waarde uit de inter-part rapid rijen in _raw_data.

@@ -90,6 +90,7 @@ C = {
     'toolbar_bg':  '#1A1A2E',
     'btn_bg':      '#2A2A4A',
     'btn_hover':   '#3A3A60',
+    'btn_active':  '#1A5A3A',   # groene achtergrond voor actieve modus-knop
     'btn_fg':      '#C8C8E8',
     'status_bg':   '#111120',
     'text_dim':    '#5566AA',
@@ -164,7 +165,9 @@ class OrdViewer:
         self._press_pos:  tuple | None = None   # voor klik-vs-sleep detectie
         self._fit_pending: bool = False
         self._conflicts:  list = []   # SegmentConflict objecten + positie (mm)
-        self._sel_part:   int | None = None    # index in processor.parts
+        self._sel_part:   int | None = None    # index in processor.parts (wissel-modus)
+        self._speed_sel:  set = set()           # onderdelen voor snelheidsaanpassing
+        self._edit_mode:  str = ''              # '' | 'swap' | 'speed'
         self._dirty:      bool = False          # herordening nog niet opgeslagen
 
         self._build_ui()
@@ -210,12 +213,34 @@ class OrdViewer:
         self._btn_swap = tooltip(
             btn(tb, '⇄  Wissel', self._toggle_swap_mode),
             'Snijvolgorde wisselen\n'
-            'Klik op een onderdeel in de tekening om het te selecteren (geel gemarkeerd).\n'
-            'Klik daarna op een tweede onderdeel\n'
-            'om de snijvolgorde van beide te wisselen.\n'
-            'Klik nogmaals op hetzelfde onderdeel of op ⇄ om de selectie te wissen.'
+            '1e klik: activeer modus (knop licht op).\n'
+            'Klik een onderdeel aan om te selecteren (geel).\n'
+            'Klik een tweede onderdeel aan om te wisselen.\n'
+            'Opnieuw klikken op ⇄ of op leeg canvas deselecteert.'
         )
         self._btn_swap.pack(side=tk.LEFT, padx=2)
+
+        # Leave-bindings voor modus-knoppen: add='+' zodat de tooltip-binding
+        # NIET overschreven wordt. De kleur wordt dynamisch bepaald op basis
+        # van de huidige modus op het moment van hoveren.
+        self._btn_swap.bind('<Leave>', lambda e: self._btn_swap.config(
+            bg=C['btn_active'] if self._edit_mode == 'swap' else C['btn_bg'],
+            fg='#FFFFFF'       if self._edit_mode == 'swap' else C['btn_fg'],
+        ), add='+')
+
+        self._btn_speed = tooltip(
+            btn(tb, '✏  Snijsnelheid', self._toggle_speed_mode),
+            'Snijsnelheid aanpassen\n'
+            '1e klik: activeer modus (knop licht op).\n'
+            'Klik onderdelen aan om ze te selecteren (cyaan).\n'
+            '2e klik op knop: open dialoogvenster om toe te passen.\n'
+            'Geen selectie = alle contouren aanpassen.'
+        )
+        self._btn_speed.pack(side=tk.LEFT, padx=2)
+        self._btn_speed.bind('<Leave>', lambda e: self._btn_speed.config(
+            bg=C['btn_active'] if self._edit_mode == 'speed' else C['btn_bg'],
+            fg='#FFFFFF'       if self._edit_mode == 'speed' else C['btn_fg'],
+        ), add='+')
         self._btn_save = tooltip(
             btn(tb, '💾  Opslaan', self.save_file),
             'Opslaan\n'
@@ -636,45 +661,84 @@ class OrdViewer:
     # Volgorde-wissel
     # ------------------------------------------------------------------
 
+    def _set_mode(self, mode: str):
+        """
+        Wissel naar de opgegeven modus ('' | 'swap' | 'speed').
+        Wist de selectie van de vorige modus.
+        """
+        if mode == self._edit_mode:
+            return
+        # Wis selectie van de huidige modus
+        self._sel_part = None
+        self._speed_sel.clear()
+        self._edit_mode = mode
+        self._update_swap_status()
+        self._update_mode_buttons()
+        self._redraw()
+
+    def _update_mode_buttons(self):
+        """Highlight de knop van de actieve modus; zet de andere terug.
+        Bindings worden NIET opnieuw gezet — die zijn eenmalig in _build_ui
+        gezet met add='+' zodat de tooltip-Leave-binding intact blijft."""
+        for btn, mode_key in ((self._btn_swap, 'swap'),
+                               (self._btn_speed, 'speed')):
+            active = self._edit_mode == mode_key
+            btn.config(
+                bg=C['btn_active'] if active else C['btn_bg'],
+                fg='#FFFFFF'       if active else C['btn_fg'],
+            )
+
     def _toggle_swap_mode(self):
         """Zet wissel-modus aan/uit."""
-        if self._sel_part is not None:
-            self._sel_part = None
-            self._update_swap_status()
-            self._redraw()
-        # Modus is impliciet: zolang er een selectie is, zitten we in wissel-modus.
-        # Gebruiker klikt op een part om te selecteren; tweede klik wisselt.
+        self._set_mode('' if self._edit_mode == 'swap' else 'swap')
+
+    def _toggle_speed_mode(self):
+        """
+        Eerste klik: activeer snijsnelheid-modus (klik onderdelen om te selecteren).
+        Tweede klik op actieve knop: open dialoogvenster om snelheid toe te passen.
+        """
+        if self._edit_mode == 'speed':
+            self._open_speed_dialog()
+        else:
+            self._set_mode('speed')
 
     def _on_canvas_click(self, px: int, py: int):
         """Verwerk een klik op het canvas voor part-selectie en -wissel."""
         if not self.processor:
             return
+        if self._edit_mode not in ('swap', 'speed'):
+            return  # geen actieve modus
         xmm, ymm = self._to_world(px, py)
         hit = self._hit_part(xmm, ymm)
 
-        if hit is None:
-            # Klik in lege ruimte → deselecteer
-            self._sel_part = None
-            self._update_swap_status()
-            self._redraw()
-            return
+        if self._edit_mode == 'swap':
+            if hit is None:
+                self._sel_part = None
+                self._update_swap_status()
+                self._redraw()
+                return
+            if self._sel_part is None:
+                self._sel_part = hit
+                self._update_swap_status()
+                self._redraw()
+                return
+            if self._sel_part == hit:
+                self._sel_part = None
+                self._update_swap_status()
+                self._redraw()
+                return
+            self._try_swap(self._sel_part, hit)
 
-        if self._sel_part is None:
-            # Eerste selectie
-            self._sel_part = hit
-            self._update_swap_status()
+        elif self._edit_mode == 'speed':
+            if hit is None:
+                return
+            if hit in self._speed_sel:
+                self._speed_sel.discard(hit)
+            else:
+                self._speed_sel.add(hit)
             self._redraw()
-            return
 
-        if self._sel_part == hit:
-            # Zelfde part nogmaals klikken → deselecteer
-            self._sel_part = None
-            self._update_swap_status()
-            self._redraw()
-            return
 
-        # Twee verschillende parts geselecteerd → probeer te wisselen
-        self._try_swap(self._sel_part, hit)
 
     def _hit_part(self, xmm: float, ymm: float) -> 'int | None':
         """Geeft de index in processor.parts terug van het part onder (xmm, ymm)."""
@@ -797,6 +861,125 @@ class OrdViewer:
         z_info = f', traverse {traverse_z:.1f} mm' if traverse_z > 0 else ', geen traverse (Z=0)'
         mb.showinfo('Opgeslagen',
                     f'Bestand opgeslagen:\n{os.path.basename(path)}{z_info}')
+
+    def _open_speed_dialog(self):
+        """
+        Dialoogvenster om de snijsnelheid (F5) aan te passen.
+        Ctrl+klik op onderdelen voor gedeeltelijke selectie (cyaan ring).
+        Zonder selectie: optie voor alle contouren.
+        """
+        if not self.processor:
+            return
+
+        # Detecteer huidige snijsnelheid (meest voorkomende F5 != 0)
+        from collections import Counter
+        speeds = Counter()
+        for row in self.processor._raw_data:
+            try:
+                f5 = int(row[4].strip())
+                if f5 != 0:
+                    speeds[f5] += 1
+            except (IndexError, ValueError):
+                pass
+        current_speed = speeds.most_common(1)[0][0] if speeds else 20
+
+        n_sel = len(self._speed_sel)
+        has_sel = n_sel > 0
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Snijsnelheid aanpassen')
+        dlg.resizable(False, False)
+        dlg.configure(bg=C['bg'])
+        dlg.grab_set()
+
+        self.root.update_idletasks()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        dlg.geometry(f'340x230+{rx + rw//2 - 170}+{ry + rh//2 - 115}')
+
+        tk.Label(dlg, text='Snijsnelheid (F5)',
+                 bg=C['bg'], fg=C['text_bright'],
+                 font=('Segoe UI', 10, 'bold')).pack(pady=(16, 4))
+
+        tk.Label(dlg,
+                 text='Nieuwe waarde voor de snijsnelheidsparameter (F5).\n'
+                      'Rapids (F5=0) worden nooit aangepast.',
+                 bg=C['bg'], fg=C['text_dim'],
+                 font=('Segoe UI', 8), justify=tk.CENTER).pack(pady=(0, 8))
+
+        entry_var = tk.StringVar(value=str(current_speed))
+        entry = tk.Entry(dlg, textvariable=entry_var,
+                         bg=C['btn_bg'], fg=C['text_bright'],
+                         insertbackground=C['text_bright'],
+                         font=('Consolas', 11), width=8, justify=tk.CENTER,
+                         relief=tk.FLAT, bd=4)
+        entry.pack()
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+
+        # Scope-keuze
+        scope_var = tk.StringVar(value='sel' if has_sel else 'all')
+        scope_frame = tk.Frame(dlg, bg=C['bg'])
+        scope_frame.pack(pady=(10, 0))
+
+        def rb(text, val, state=tk.NORMAL):
+            return tk.Radiobutton(
+                scope_frame, text=text, variable=scope_var, value=val,
+                bg=C['bg'], fg=C['text_bright'] if state == tk.NORMAL else C['text_dim'],
+                selectcolor=C['bg'], activebackground=C['bg'],
+                font=('Segoe UI', 9), state=state
+            )
+
+        rb('Alle contouren', 'all').pack(anchor=tk.W)
+        sel_label = (f'Geselecteerde onderdelen  ({n_sel} geselecteerd)'
+                     if has_sel else
+                     'Geselecteerde onderdelen  (Ctrl+klik om te selecteren)')
+        rb(sel_label, 'sel',
+           state=tk.NORMAL if has_sel else tk.DISABLED).pack(anchor=tk.W)
+
+        result = [None]
+
+        def ok(_event=None):
+            try:
+                v = int(entry_var.get().strip())
+                if v <= 0:
+                    raise ValueError
+                result[0] = (v, scope_var.get())
+                dlg.destroy()
+            except ValueError:
+                entry.config(bg='#4A1A1A')
+                entry.after(600, lambda: entry.config(bg=C['btn_bg']))
+
+        entry.bind('<Return>', ok)
+
+        btn_frame = tk.Frame(dlg, bg=C['bg'])
+        btn_frame.pack(pady=(14, 0))
+        for text, cmd in [('Annuleren', dlg.destroy), ('Toepassen', ok)]:
+            b = tk.Label(btn_frame, text=text,
+                         bg=C['btn_bg'], fg=C['btn_fg'],
+                         font=('Segoe UI', 9), padx=14, pady=5,
+                         cursor='hand2', relief=tk.FLAT)
+            b.bind('<Button-1>', lambda e, c=cmd: c())
+            b.bind('<Enter>', lambda e, w=b: w.config(bg=C['btn_hover']))
+            b.bind('<Leave>', lambda e, w=b: w.config(bg=C['btn_bg']))
+            b.pack(side=tk.LEFT, padx=4)
+
+        dlg.wait_window()
+
+        if result[0] is None:
+            return
+        new_speed, scope = result[0]
+
+        if scope == 'sel' and has_sel:
+            part_indices = [self.processor.parts[i].part_index
+                            for i in self._speed_sel]
+        else:
+            part_indices = None
+
+        self.processor.apply_cutting_speed(new_speed, part_indices)
+        self._set_mode('')   # sluit speed-modus + wist selectie + update knoppen
+        self._dirty = True
+        self._redraw()
 
     def _ask_traverse_height(self, default_mm: float = 0.0) -> 'float | None':
         """
@@ -1079,12 +1262,19 @@ class OrdViewer:
 
             label = str(idx + 1)  # positie in huidige snijvolgorde
             r = 9 + (len(label) - 1) * 3
-            is_sel = (idx == self._sel_part)
-            # Highlight ring voor geselecteerd part
+            is_sel       = (idx == self._sel_part)
+            is_speed_sel = (idx in self._speed_sel)
+            # Highlight ring voor geselecteerd part (wissel: geel)
             if is_sel:
                 self._canvas.create_oval(
                     px - r - 5, py - r - 5, px + r + 5, py + r + 5,
                     fill='', outline='#FACC15', width=2
+                )
+            # Cyaan ring voor snelheids-selectie
+            if is_speed_sel:
+                self._canvas.create_oval(
+                    px - r - 8, py - r - 8, px + r + 8, py + r + 8,
+                    fill='', outline='#22D3EE', width=2
                 )
             # Witte rand
             self._canvas.create_oval(
