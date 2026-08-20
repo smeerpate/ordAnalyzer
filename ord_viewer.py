@@ -80,6 +80,72 @@ def tooltip(widget: tk.Widget, text: str) -> '_Tooltip':
     _Tooltip(widget, text)
     return widget
 
+
+class _CenteredInfoPanel:
+    """
+    Groter info-venster dat gecentreerd over het hoofdvenster verschijnt.
+    Breedte past zich aan de langste tekstregel aan (geen wraplength).
+    Bedoeld voor het ℹ-label in de toolbar.
+    """
+    def __init__(self, widget: tk.Widget, text: str, root: tk.Tk, delay: int = 300):
+        self._widget = widget
+        self._text   = text
+        self._root   = root
+        self._delay  = delay
+        self._id     = None
+        self._win    = None
+        widget.bind('<Enter>',       self._schedule)
+        widget.bind('<Leave>',       self._cancel)
+        widget.bind('<ButtonPress>', self._cancel)
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._id = self._widget.after(self._delay, self._show)
+
+    def _cancel(self, _event=None):
+        if self._id:
+            self._widget.after_cancel(self._id)
+            self._id = None
+        if self._win:
+            self._win.destroy()
+            self._win = None
+
+    def _show(self):
+        if self._win:
+            return
+        self._win = tk.Toplevel(self._widget)
+        self._win.wm_overrideredirect(True)
+        self._win.configure(bg='#3A3A60')
+        self._win.wm_attributes('-topmost', True)
+
+        lbl = tk.Label(
+            self._win,
+            text=self._text,
+            bg='#1E1E3A', fg='#C8C8E8',
+            font=('Consolas', 8),
+            relief=tk.FLAT, bd=0,
+            padx=12, pady=10,
+            justify=tk.LEFT,
+            wraplength=0,          # geen automatische afbreking
+        )
+        lbl.pack(padx=1, pady=1)
+
+        # Bereken grootte na renderen
+        self._win.update_idletasks()
+        w = self._win.winfo_reqwidth()
+        h = self._win.winfo_reqheight()
+
+        # Centreer over het hoofdvenster
+        self._root.update_idletasks()
+        rx = self._root.winfo_rootx()
+        ry = self._root.winfo_rooty()
+        rw = self._root.winfo_width()
+        rh = self._root.winfo_height()
+        x = rx + (rw - w) // 2
+        y = ry + (rh - h) // 2
+
+        self._win.wm_geometry(f'{w}x{h}+{x}+{y}')
+
 # ---------------------------------------------------------------------------
 # Kleurenthema
 # ---------------------------------------------------------------------------
@@ -104,14 +170,14 @@ C = {
 
 # Iron palette aangepast voor zwarte achtergrond: paars uitgerekt, geen zwart
 _HEAT_STOPS = [
-    (0.00,  0x58, 0x00, 0x90),  # indigo/paars (zichtbaar op zwart)
-    (0.18,  0x90, 0x00, 0xB8),  # helder paars
-    (0.35,  0xC0, 0x00, 0x80),  # paars-magenta
-    (0.50,  0xD4, 0x00, 0x30),  # donkerrood
-    (0.63,  0xF0, 0x50, 0x00),  # rood-oranje
-    (0.75,  0xFF, 0x88, 0x00),  # oranje
-    (0.88,  0xFF, 0xC8, 0x00),  # geel
-    (1.00,  0xFF, 0xFF, 0xFF),  # wit
+    # Ioniseringsgradiënt: paars → rood → oranje → geel → wit.
+    # Stops liggen exact op F5-waarden 20/40/60/80 voor maximaal contrast.
+    (0.00,  0x30, 0x00, 0x60),  # diep paars   –   0 %
+    (0.20,  0x99, 0x00, 0xCC),  # levendig paars – 20 %
+    (0.40,  0xCC, 0x00, 0x30),  # karmijnrood  –  40 %
+    (0.60,  0xFF, 0x66, 0x00),  # oranje       –  60 %
+    (0.80,  0xFF, 0xCC, 0x00),  # geel         –  80 %
+    (1.00,  0xFF, 0xFF, 0xFF),  # wit          – 100 %
 ]
 
 
@@ -151,7 +217,7 @@ def _nice_grid_step(scale_px_per_mm: float) -> float:
 class OrdViewer:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("ORD Viewer")
+        self.root.title("ORD Viewer  v0.2  —  Twenty Three BV")
         self.root.geometry("1280x800")
         self.root.configure(bg=C['bg'])
 
@@ -169,6 +235,7 @@ class OrdViewer:
         self._speed_sel:  set = set()           # onderdelen voor snelheidsaanpassing
         self._edit_mode:  str = ''              # '' | 'swap' | 'speed'
         self._dirty:      bool = False          # herordening nog niet opgeslagen
+        self._speed_dirty: bool = False         # snijsnelheid aangepast, nog niet opgeslagen
 
         self._build_ui()
         self._bind_events()
@@ -241,6 +308,15 @@ class OrdViewer:
             bg=C['btn_active'] if self._edit_mode == 'speed' else C['btn_bg'],
             fg='#FFFFFF'       if self._edit_mode == 'speed' else C['btn_fg'],
         ), add='+')
+        self._btn_similar = tooltip(
+            btn(tb, '≈  Gelijkaardig', self._select_similar_contours),
+            'Gelijkaardige contouren selecteren\n'
+            'Selecteert alle contouren met dezelfde vorm als de\n'
+            'huidige selectie (zelfde aantal ankerpunten,\n'
+            'gelijke segmentlengtes en oppervlakte).\n'
+            'Alleen actief in snijsnelheid-modus met een selectie.'
+        )
+        self._btn_similar.pack(side=tk.LEFT, padx=(0, 6))
         self._btn_save = tooltip(
             btn(tb, '💾  Opslaan', self.save_file),
             'Opslaan\n'
@@ -255,21 +331,40 @@ class OrdViewer:
                                    font=('Segoe UI', 9))
         self._lbl_file.pack(side=tk.LEFT, padx=16)
 
-        # ℹ bediening-hint rechts in toolbar
-        tooltip(
-            tk.Label(tb, text='ℹ',
-                     bg=C['toolbar_bg'], fg=C['text_dim'],
-                     font=('Segoe UI', 11), cursor='question_arrow'),
+        # ℹ bediening-hint rechts in toolbar (gecentreerd over hoofdvenster)
+        _info_lbl = tk.Label(tb, text='ℹ',
+                             bg=C['toolbar_bg'], fg=C['text_dim'],
+                             font=('Segoe UI', 11), cursor='question_arrow')
+        _CenteredInfoPanel(_info_lbl,
+            'ORD Viewer  v0.2  —  Twenty Three BV  (2026-08-20)\n'
+            '─────────────────────────────────────\n'
             'Bediening canvas\n'
             '  Slepen (links/midden)  Pannen\n'
             '  Muiswiel               Zoomen op cursor\n'
             '  Dubbelklik             Alles in beeld\n'
             '\n'
-            'Kleuren\n'
-            '  Groen gestippeld       Rapid traverse (geen snijden)\n'
-            '  Paars → wit heatmap    Snijsnelheid (laag → hoog)\n'
+            'Kleuren snijlijnen\n'
+            '  Paars/rood/oranje/geel  Snijsnelheid 20/40/60/80 %\n'
+            '  Groen gestippeld       Rapid traverse\n'
+            '  Cyaan highlight        Geselecteerde contour (snelheid)\n'
             '\n'
             'Nummers in cirkel        Snijvolgorde per onderdeel\n'
+            '\n'
+            'Snijvolgorde wisselen  (⇄ Wissel)\n'
+            '  Klik een onderdeel aan → geel gemarkeerd\n'
+            '  Klik een tweede onderdeel → volgorde gewisseld\n'
+            '\n'
+            'Snijsnelheid aanpassen  (✏ Snijsnelheid)\n'
+            '  Klik op een snijlijn → contour geselecteerd (cyaan)\n'
+            '  ≈ Gelijkaardig → selecteert alle contouren met\n'
+            '    dezelfde vorm en grootte\n'
+            '  Klik opnieuw op ✏ → dialoog om F5 in te stellen\n'
+            '  Keuze: geselecteerde contouren of alle contouren\n'
+            '\n'
+            'Opslaan  (💾)\n'
+            '  Vraagt traversehoogte (Z tijdens rapids)\n'
+            '  Schrijft nieuw .ord bestand weg\n'
+            '  STA-bestand wordt verwijderd na bevestiging\n'
             '\n'
             'Waarschuwingen (zijpaneel)\n'
             '  ⚠ Geen safety hoogte   Alle Z-waarden zijn 0\n'
@@ -278,8 +373,9 @@ class OrdViewer:
             '\n'
             'Conflicten (zijpaneel)\n'
             '  ⚠ geel                 Overlappende snijlijnen\n'
-            '  ✕ rood                 Kruisende snijlijnen'
-        ).pack(side=tk.RIGHT, padx=12)
+            '  ✕ rood                 Kruisende snijlijnen',
+            self.root)
+        _info_lbl.pack(side=tk.RIGHT, padx=12)
 
         # ---- Hoofd-gebied: canvas + paneel ----
         main = tk.Frame(self.root, bg=C['bg'])
@@ -366,14 +462,12 @@ class OrdViewer:
         tk.Label(leg, text=' rapid  ', bg=C['status_bg'], fg=C['text_dim'],
                  font=('Segoe UI', 8)).pack(side=tk.LEFT)
 
-        # Heatmap gradient: blokjes voor v=0, 20, 40, 60, 80, 100
-        tk.Label(leg, text='v:', bg=C['status_bg'], fg=C['text_dim'],
-                 font=('Segoe UI', 8)).pack(side=tk.LEFT)
-        for v in range(0, 101, 10):
+        # Heatmap: toon de exacte snelheidsstappen met label
+        for v, label in [(20, '20'), (40, '40'), (60, '60'), (80, '80'), (100, '100')]:
             tk.Label(leg, text='█', bg=C['status_bg'], fg=speed_color(v),
-                     font=('Consolas', 8)).pack(side=tk.LEFT, padx=0)
-        tk.Label(leg, text=' 0→100', bg=C['status_bg'], fg=C['text_dim'],
-                 font=('Segoe UI', 8)).pack(side=tk.LEFT)
+                     font=('Consolas', 10)).pack(side=tk.LEFT, padx=0)
+            tk.Label(leg, text=label + ' ', bg=C['status_bg'], fg=C['text_dim'],
+                     font=('Segoe UI', 8)).pack(side=tk.LEFT, padx=0)
 
         self._lbl_zoom = tk.Label(sb, text='—',
                                    bg=C['status_bg'], fg=C['text_dim'],
@@ -687,6 +781,13 @@ class OrdViewer:
                 bg=C['btn_active'] if active else C['btn_bg'],
                 fg='#FFFFFF'       if active else C['btn_fg'],
             )
+        # ≈-knop: alleen actief in speed-modus én met selectie
+        similar_active = (self._edit_mode == 'speed' and bool(self._speed_sel))
+        self._btn_similar.config(
+            bg=C['btn_bg'],
+            fg=C['btn_fg'] if similar_active else C['text_dim'],
+            cursor='hand2' if similar_active else 'arrow',
+        )
 
     def _toggle_swap_mode(self):
         """Zet wissel-modus aan/uit."""
@@ -730,15 +831,108 @@ class OrdViewer:
             self._try_swap(self._sel_part, hit)
 
         elif self._edit_mode == 'speed':
-            if hit is None:
+            # Gebruik dichtstbijzijnde contour, niet het part
+            hit_c = self._hit_contour(xmm, ymm)
+            if hit_c is None:
                 return
-            if hit in self._speed_sel:
-                self._speed_sel.discard(hit)
+            if hit_c in self._speed_sel:
+                self._speed_sel.discard(hit_c)
             else:
-                self._speed_sel.add(hit)
+                self._speed_sel.add(hit_c)
+            self._update_mode_buttons()   # ≈-knop aan/uit
             self._redraw()
 
 
+
+
+    def _select_similar_contours(self):
+        """
+        Voeg alle contouren toe aan de selectie die qua vorm gelijkaardig zijn
+        aan de reeds geselecteerde contouren.
+
+        Gelijkaardigheid = zelfde aantal segmenten + gelijke gesorteerde
+        segmentlengtes + gelijke oppervlakte (alle binnen 0.5% relatieve
+        tolerantie of 0.05 mm absoluut).
+        """
+        if self._edit_mode != 'speed' or not self._speed_sel or not self.processor:
+            return
+
+        import math as _math
+
+        TOL_REL = 0.005   # 0.5 %
+        TOL_ABS = 0.05    # mm  (voor zeer korte segmenten)
+
+        def seg_lengths(c):
+            return sorted(
+                _math.hypot(s.end[0] - s.start[0], s.end[1] - s.start[1])
+                for s in c.segments
+            )
+
+        def similar(ref, cand):
+            if len(ref.segments) != len(cand.segments):
+                return False
+            # Oppervlakte
+            ref_a, cand_a = ref.area, cand.area
+            if ref_a > 0.01:
+                if abs(ref_a - cand_a) / ref_a > TOL_REL:
+                    return False
+            # Segmentlengtes
+            for rl, cl in zip(seg_lengths(ref), seg_lengths(cand)):
+                if abs(rl - cl) > max(TOL_ABS, TOL_REL * max(rl, cl)):
+                    return False
+            return True
+
+        # Bouw referentieset uit geselecteerde contouren
+        all_contours = [
+            c for part in self.processor.parts
+            for c in part.outer_contours + part.holes
+        ]
+        ref_contours = [c for c in all_contours if c.index in self._speed_sel]
+
+        added = 0
+        for cand in all_contours:
+            if cand.index in self._speed_sel:
+                continue
+            if any(similar(ref, cand) for ref in ref_contours):
+                self._speed_sel.add(cand.index)
+                added += 1
+
+        self._update_mode_buttons()
+        self._redraw()
+
+    def _hit_contour(self, xmm: float, ymm: float,
+                     threshold_px: float = 8.0) -> 'int | None':
+        """
+        Geeft de contour.index terug van de dichtstbijzijnde snijlijn.
+        Zoekt de contour waarvan een segment het dichtst bij (xmm, ymm) ligt,
+        binnen threshold_px schermpixels.
+        """
+        if not self.processor:
+            return None
+        import math as _math
+
+        def dist_to_seg(px, py, x1, y1, x2, y2):
+            dx, dy = x2 - x1, y2 - y1
+            if dx == 0 and dy == 0:
+                return _math.hypot(px - x1, py - y1)
+            t = max(0.0, min(1.0,
+                ((px - x1) * dx + (py - y1) * dy) / (dx*dx + dy*dy)))
+            return _math.hypot(px - (x1 + t*dx), py - (y1 + t*dy))
+
+        threshold_mm = threshold_px / max(self._scale, 0.001)
+        best_dist = threshold_mm
+        best_idx  = None
+
+        for part in self.processor.parts:
+            for c in part.outer_contours + part.holes:
+                for seg in c.segments:
+                    d = dist_to_seg(xmm, ymm,
+                                    seg.start[0], seg.start[1],
+                                    seg.end[0],   seg.end[1])
+                    if d < best_dist:
+                        best_dist = d
+                        best_idx  = c.index
+        return best_idx
 
     def _hit_part(self, xmm: float, ymm: float) -> 'int | None':
         """Geeft de index in processor.parts terug van het part onder (xmm, ymm)."""
@@ -821,16 +1015,21 @@ class OrdViewer:
         if self._sel_part is not None:
             num = self.processor.parts[self._sel_part].part_index + 1
             self._lbl_sel.config(
-                text=f'Part {num} geselecteerd — klik een ander part met gelijke bbox om te wisselen.',
+                text=f'Part {num} geselecteerd — klik een ander part om te wisselen.',
                 fg='#FACC15'
             )
-        elif self._dirty:
-            self._lbl_sel.config(
-                text='Volgorde gewijzigd — gebruik 💾 Opslaan om op te slaan.',
-                fg='#4ADE80'
-            )
         else:
-            self._lbl_sel.config(text='', fg='#FACC15')
+            parts = []
+            if self._dirty:       parts.append('snijvolgorde')
+            if self._speed_dirty: parts.append('snijsnelheid')
+            if parts:
+                self._lbl_sel.config(
+                    text=f'{" en ".join(parts).capitalize()} gewijzigd '
+                         f'— gebruik 💾 Opslaan om op te slaan.',
+                    fg='#4ADE80'
+                )
+            else:
+                self._lbl_sel.config(text='', fg='#FACC15')
 
     def save_file(self):
         """Sla het hergeordende ORD-bestand op."""
@@ -856,6 +1055,7 @@ class OrdViewer:
         new_order = [p.part_index for p in self.processor.parts]
         self.processor.save(path, new_order, traverse_z_mm=traverse_z)
         self._dirty = False
+        self._speed_dirty = False
         self._update_swap_status()
         from tkinter import messagebox as mb
         z_info = f', traverse {traverse_z:.1f} mm' if traverse_z > 0 else ', geen traverse (Z=0)'
@@ -883,6 +1083,7 @@ class OrdViewer:
                 pass
         current_speed = speeds.most_common(1)[0][0] if speeds else 20
 
+        # _speed_sel bevat contour.index waarden
         n_sel = len(self._speed_sel)
         has_sel = n_sel > 0
 
@@ -931,9 +1132,9 @@ class OrdViewer:
             )
 
         rb('Alle contouren', 'all').pack(anchor=tk.W)
-        sel_label = (f'Geselecteerde onderdelen  ({n_sel} geselecteerd)'
+        sel_label = (f'Geselecteerde contouren  ({n_sel} geselecteerd)'
                      if has_sel else
-                     'Geselecteerde onderdelen  (Ctrl+klik om te selecteren)')
+                     'Geselecteerde contouren  (klik op snijlijn om te selecteren)')
         rb(sel_label, 'sel',
            state=tk.NORMAL if has_sel else tk.DISABLED).pack(anchor=tk.W)
 
@@ -971,14 +1172,14 @@ class OrdViewer:
         new_speed, scope = result[0]
 
         if scope == 'sel' and has_sel:
-            part_indices = [self.processor.parts[i].part_index
-                            for i in self._speed_sel]
+            # _speed_sel bevat contour.index waarden → geef door als contour_indices
+            self.processor.apply_cutting_speed(
+                new_speed, contour_indices=list(self._speed_sel))
         else:
-            part_indices = None
-
-        self.processor.apply_cutting_speed(new_speed, part_indices)
+            self.processor.apply_cutting_speed(new_speed)
         self._set_mode('')   # sluit speed-modus + wist selectie + update knoppen
-        self._dirty = True
+        self._speed_dirty = True
+        self._update_swap_status()
         self._redraw()
 
     def _ask_traverse_height(self, default_mm: float = 0.0) -> 'float | None':
@@ -1147,6 +1348,7 @@ class OrdViewer:
         if self.processor:
             self._draw_rapids()
             self._draw_contours()
+            self._draw_speed_selection()
             self._draw_part_labels()
             self._draw_conflicts()
         self._update_zoom_label()
@@ -1237,6 +1439,27 @@ class OrdViewer:
                                           fill=color, width=lw,
                                           joinstyle=tk.ROUND, capstyle=tk.ROUND)
 
+
+    def _draw_speed_selection(self):
+        """Teken cyaan highlight over geselecteerde contouren (speed-modus)."""
+        if not self._speed_sel or not self.processor:
+            return
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        for part in self.processor.parts:
+            for c in part.outer_contours + part.holes:
+                if c.index not in self._speed_sel:
+                    continue
+                for seg in c.segments:
+                    px0, py0 = self._to_screen(*seg.start)
+                    px1, py1 = self._to_screen(*seg.end)
+                    # Brede cyaan lijn als highlight onder de snijlijn
+                    self._canvas.create_line(
+                        px0, py0, px1, py1,
+                        fill='#22D3EE', width=4,
+                        joinstyle=tk.ROUND, capstyle=tk.ROUND
+                    )
+
     def _draw_part_labels(self):
         """Teken het volgnummer van elk onderdeel op het zwaartepunt."""
         cw = self._canvas.winfo_width()
@@ -1262,19 +1485,12 @@ class OrdViewer:
 
             label = str(idx + 1)  # positie in huidige snijvolgorde
             r = 9 + (len(label) - 1) * 3
-            is_sel       = (idx == self._sel_part)
-            is_speed_sel = (idx in self._speed_sel)
+            is_sel = (idx == self._sel_part)
             # Highlight ring voor geselecteerd part (wissel: geel)
             if is_sel:
                 self._canvas.create_oval(
                     px - r - 5, py - r - 5, px + r + 5, py + r + 5,
                     fill='', outline='#FACC15', width=2
-                )
-            # Cyaan ring voor snelheids-selectie
-            if is_speed_sel:
-                self._canvas.create_oval(
-                    px - r - 8, py - r - 8, px + r + 8, py + r + 8,
-                    fill='', outline='#22D3EE', width=2
                 )
             # Witte rand
             self._canvas.create_oval(

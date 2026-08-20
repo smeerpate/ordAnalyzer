@@ -865,32 +865,46 @@ class OrdProcessor:
                 self._inter_rapids.append(rapid)
 
     def apply_cutting_speed(self, new_speed: int,
-                             part_indices: 'list[int] | None' = None):
+                             part_indices: 'list[int] | None' = None,
+                             contour_indices: 'list[int] | None' = None):
         """
-        Pas de snijsnelheid (F5) aan in _raw_data en _raw_lines.
+        Pas de snijsnelheid (F5) aan in _raw_data, _raw_lines en CutSegments.
 
-        new_speed     : de nieuwe F5-waarde (bv. 20, 40, 60)
-        part_indices  : lijst van part.part_index waarden die aangepast
-                        worden. None = alle snijcontouren.
+        new_speed       : de nieuwe F5-waarde (bv. 20, 40, 60)
+        part_indices    : lijst van part.part_index waarden. None = alles.
+        contour_indices : lijst van contour.index waarden (prioriteit boven
+                          part_indices als opgegeven).
 
         Rijen met F5=0 (rapids) worden nooit aangepast.
         """
         self._ensure_parsed()
 
-        # Bepaal de rijbereiken die aangepast mogen worden
-        if part_indices is None:
-            # Alle rijen
-            allowed_rows = set(range(len(self._raw_data)))
-        else:
-            allowed_rows: set[int] = set()
+        # Bepaal de contouren die aangepast mogen worden
+        if contour_indices is not None:
+            c_set = set(contour_indices)
+            target_contours = [
+                c for part in self.parts
+                for c in part.outer_contours + part.holes
+                if c.index in c_set
+            ]
+        elif part_indices is not None:
             idx_set = set(part_indices)
-            for part in self.parts:
-                if part.part_index not in idx_set:
-                    continue
-                for c in part.outer_contours + part.holes:
-                    if c.first_data_row >= 0:
-                        for r in range(c.first_data_row, c.last_data_row + 1):
-                            allowed_rows.add(r)
+            target_contours = [
+                c for part in self.parts
+                if part.part_index in idx_set
+                for c in part.outer_contours + part.holes
+            ]
+        else:
+            target_contours = [
+                c for part in self.parts
+                for c in part.outer_contours + part.holes
+            ]
+
+        allowed_rows: set[int] = set()
+        for c in target_contours:
+            if c.first_data_row >= 0:
+                for r in range(c.first_data_row, c.last_data_row + 1):
+                    allowed_rows.add(r)
 
         for i, row in enumerate(self._raw_data):
             if i not in allowed_rows:
@@ -920,14 +934,10 @@ class OrdProcessor:
 
         # Update ook de CutSegment-objecten zodat de UI direct de nieuwe
         # kleurschakering toont zonder herparsen.
-        part_idx_set = None if part_indices is None else set(part_indices)
-        for part in self.parts:
-            if part_idx_set is not None and part.part_index not in part_idx_set:
-                continue
-            for c in part.outer_contours + part.holes:
-                for seg in c.segments:
-                    if seg.feed_code != 0:   # rapid-segmenten niet aanpassen
-                        seg.feed_code = new_speed
+        for c in target_contours:
+            for seg in c.segments:
+                if seg.feed_code != 0:   # rapid-segmenten niet aanpassen
+                    seg.feed_code = new_speed
 
         self._dirty_speed = True
 
