@@ -248,6 +248,7 @@ class OrdProcessor:
         self.parts:    List[OrdPart] = []
         self.no_safety_height:   bool = False  # True als alle Z-waarden 0 zijn
         self.has_negative_z:     bool = False  # True als er Z < 0 in het bestand staat
+        self.checksum_warning:   str | None = None  # Ingesteld als checksum niet klopt
         self.cutting_not_at_z0:  bool = False  # True als snijbewegingen niet op Z=0 plaatsvinden
         self._parsed = False
 
@@ -503,6 +504,24 @@ class OrdProcessor:
             if len(flds) >= 7:
                 self._raw_data.append(flds)
                 self._raw_lines.append(line.strip())
+
+        # ── Checksum controle ───────────────────────────────────────────
+        import re as _re
+        m = _re.search(r'(\d+)\s+(\d+)\s*$', self.header)
+        if m:
+            hdr_n7  = int(m.group(1))
+            hdr_n10 = int(m.group(2))
+            act_n7  = sum(1 for ln in self._raw_lines
+                          if len([v for v in ln.split(",") if v.strip()]) == 7)
+            act_n10 = sum(1 for ln in self._raw_lines
+                          if len([v for v in ln.split(",") if v.strip()]) == 10)
+            if hdr_n7 != act_n7 - 1 or hdr_n10 != act_n10:
+                self.checksum_warning = (
+                    f"Checksum van het ORD-bestand klopt niet!\n\n"
+                    f"  7-veld regels:   verwacht {hdr_n7},  gevonden {act_n7 - 1}\n"
+                    f"  10-veld regels:  verwacht {hdr_n10},  gevonden {act_n10}\n\n"
+                    f"Het bestand is mogelijk aangepast buiten FlowMaster."
+                )
 
         # ── Z-coördinaat controles (kolom 3, index 2) ──────────────────
         z_vals = [float(r[2]) for r in self._raw_data]
@@ -818,6 +837,18 @@ class OrdProcessor:
             for i in range(orig_last_ep + 1, len(self._raw_lines)):
                 out.append(self._raw_lines[i])
 
+        # ── Checksum: herbereken de twee getallen op regel 0 ────────────────
+        # Eerste getal  = (aantal regels met 7 velden) − 1
+        # Tweede getal  = aantal regels met 10 velden (boogbewegingen)
+        data_lines = out[2:]   # alles na header en versieregel
+        n7  = sum(1 for ln in data_lines if len([v for v in ln.split(",") if v.strip()]) == 7)
+        n10 = sum(1 for ln in data_lines if len([v for v in ln.split(",") if v.strip()]) == 10)
+        import re as _re
+        # Vervang de twee getallen achter de commentaartekst; behoud de rest van de header
+        out[0] = _re.sub(r'\d+\s+\d+\s*$',
+                         f'{n7 - 1} {n10}',
+                         out[0])
+
         return "\n".join(out) + "\n"
 
     def save(self, filepath: str,
@@ -866,7 +897,8 @@ class OrdProcessor:
 
     def apply_cutting_speed(self, new_speed: int,
                              part_indices: 'list[int] | None' = None,
-                             contour_indices: 'list[int] | None' = None):
+                             contour_indices: 'list[int] | None' = None,
+                             include_leadin: bool = True):
         """
         Pas de snijsnelheid (F5) aan in _raw_data, _raw_lines en CutSegments.
 
@@ -874,6 +906,7 @@ class OrdProcessor:
         part_indices    : lijst van part.part_index waarden. None = alles.
         contour_indices : lijst van contour.index waarden (prioriteit boven
                           part_indices als opgegeven).
+        include_leadin  : False = lead-in/out rijen (F6=0) overslaan.
 
         Rijen met F5=0 (rapids) worden nooit aangepast.
         """
@@ -915,6 +948,13 @@ class OrdProcessor:
                 continue
             if f5_val == 0:
                 continue  # rapid-rij, niet aanpassen
+            if not include_leadin:
+                # Lead-in/out overslaan: F6 = kolom 5
+                try:
+                    if row[5].strip() == '0':
+                        continue
+                except IndexError:
+                    pass
 
             # Vervang de F5-kolom in de raw lijn
             # Formaat: "   X,   Y,   Z, F4, F5, F6, ..."
@@ -936,8 +976,11 @@ class OrdProcessor:
         # kleurschakering toont zonder herparsen.
         for c in target_contours:
             for seg in c.segments:
-                if seg.feed_code != 0:   # rapid-segmenten niet aanpassen
-                    seg.feed_code = new_speed
+                if seg.feed_code == 0:
+                    continue  # rapid
+                if not include_leadin and not seg.on_profile:
+                    continue  # lead-in/out overslaan
+                seg.feed_code = new_speed
 
         self._dirty_speed = True
 

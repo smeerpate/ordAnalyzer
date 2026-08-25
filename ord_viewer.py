@@ -217,7 +217,7 @@ def _nice_grid_step(scale_px_per_mm: float) -> float:
 class OrdViewer:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("ORD Viewer  v0.2  —  Twenty Three BV")
+        self.root.title("ORD Viewer  v0.3  —  Twenty Three BV")
         self.root.geometry("1280x800")
         self.root.configure(bg=C['bg'])
 
@@ -294,6 +294,12 @@ class OrdViewer:
             bg=C['btn_active'] if self._edit_mode == 'swap' else C['btn_bg'],
             fg='#FFFFFF'       if self._edit_mode == 'swap' else C['btn_fg'],
         ), add='+')
+        tooltip(
+            btn(tb, '🔍  Zoeken', self._find_part_dialog),
+            'Onderdeel zoeken  (Ctrl+F)\n'
+            'Ga naar een onderdeel op volgnummer.\n'
+            'Het onderdeel wordt gecentreerd en geselecteerd.'
+        ).pack(side=tk.LEFT, padx=(0, 4))
 
         self._btn_speed = tooltip(
             btn(tb, '✏  Snijsnelheid', self._toggle_speed_mode),
@@ -336,7 +342,7 @@ class OrdViewer:
                              bg=C['toolbar_bg'], fg=C['text_dim'],
                              font=('Segoe UI', 11), cursor='question_arrow')
         _CenteredInfoPanel(_info_lbl,
-            'ORD Viewer  v0.2  —  Twenty Three BV  (2026-08-20)\n'
+            'ORD Viewer  v0.3  —  Twenty Three BV  (2026-08-25)\n'
             '─────────────────────────────────────\n'
             'Bediening canvas\n'
             '  Slepen (links/midden)  Pannen\n'
@@ -353,6 +359,10 @@ class OrdViewer:
             'Snijvolgorde wisselen  (⇄ Wissel)\n'
             '  Klik een onderdeel aan → geel gemarkeerd\n'
             '  Klik een tweede onderdeel → volgorde gewisseld\n'
+            '  Na wissel: volgend onderdeel automatisch geselecteerd\n'
+            '\n'
+            'Onderdeel zoeken  (🔍 Zoeken  of  Ctrl+F)\n'
+            '  Typ een volgnummer → canvas centreert en selecteert\n'
             '\n'
             'Snijsnelheid aanpassen  (✏ Snijsnelheid)\n'
             '  Klik op een snijlijn → contour geselecteerd (cyaan)\n'
@@ -360,6 +370,7 @@ class OrdViewer:
             '    dezelfde vorm en grootte\n'
             '  Klik opnieuw op ✏ → dialoog om F5 in te stellen\n'
             '  Keuze: geselecteerde contouren of alle contouren\n'
+            '  Optie: lead-in/lead-out mee aanpassen of niet\n'
             '\n'
             'Opslaan  (💾)\n'
             '  Vraagt traversehoogte (Z tijdens rapids)\n'
@@ -492,6 +503,8 @@ class OrdViewer:
         cv.bind('<Motion>',          self._on_mouse_move)
         cv.bind('<Double-Button-1>', lambda e: self.fit_to_screen())
         cv.bind('<Configure>',       self._on_resize)
+        self.root.bind('<Control-f>', lambda e: self._find_part_dialog())
+        self.root.bind('<Control-F>', lambda e: self._find_part_dialog())
 
     def _on_wheel(self, event):
         factor = 1.15 if (event.num == 4 or
@@ -558,6 +571,10 @@ class OrdViewer:
         self._update_info_panel()
         self._fit_pending = True
         self.root.after(50, self.fit_to_screen)
+
+        # ── Checksumwaarschuwing ──────────────────────────────────────────
+        if self.processor.checksum_warning:
+            messagebox.showwarning('Checksum fout', self.processor.checksum_warning)
 
         # ── Controleer op bijbehorend .sta-bestand ────────────────────────
         sta_path = os.path.splitext(path)[0] + '.sta'
@@ -754,6 +771,91 @@ class OrdViewer:
     # ------------------------------------------------------------------
     # Volgorde-wissel
     # ------------------------------------------------------------------
+
+    def _find_part_dialog(self):
+        """
+        Zoek een onderdeel op volgnummer, centreer het op het canvas
+        en selecteer het in wissel-modus (Ctrl+F).
+        """
+        if not self.processor or not self.processor.parts:
+            return
+
+        n_parts = len(self.processor.parts)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Zoeken')
+        dlg.resizable(False, False)
+        dlg.configure(bg=C['bg'])
+        dlg.grab_set()
+
+        self.root.update_idletasks()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        dlg.geometry(f'280x120+{rx + rw//2 - 140}+{ry + rh//2 - 60}')
+
+        tk.Label(dlg, text=f'Ga naar onderdeel (1 – {n_parts})',
+                 bg=C['bg'], fg=C['text_bright'],
+                 font=('Segoe UI', 10, 'bold')).pack(pady=(16, 6))
+
+        entry_var = tk.StringVar()
+        entry = tk.Entry(dlg, textvariable=entry_var,
+                         bg=C['btn_bg'], fg=C['text_bright'],
+                         insertbackground=C['text_bright'],
+                         font=('Consolas', 11), width=8, justify=tk.CENTER,
+                         relief=tk.FLAT, bd=4)
+        entry.pack()
+        entry.focus_set()
+
+        result = [None]
+
+        def ok(_event=None):
+            try:
+                v = int(entry_var.get().strip())
+                if not (1 <= v <= n_parts):
+                    raise ValueError
+                result[0] = v
+                dlg.destroy()
+            except ValueError:
+                entry.config(bg='#4A1A1A')
+                entry.after(600, lambda: entry.config(bg=C['btn_bg']))
+
+        entry.bind('<Return>', ok)
+        entry.bind('<Escape>', lambda e: dlg.destroy())
+
+        btn_frame = tk.Frame(dlg, bg=C['bg'])
+        btn_frame.pack(pady=(10, 0))
+        for text, cmd in [('Annuleren', dlg.destroy), ('Ga naar', ok)]:
+            b = tk.Label(btn_frame, text=text,
+                         bg=C['btn_bg'], fg=C['btn_fg'],
+                         font=('Segoe UI', 9), padx=12, pady=4,
+                         cursor='hand2', relief=tk.FLAT)
+            b.bind('<Button-1>', lambda e, c=cmd: c())
+            b.bind('<Enter>', lambda e, w=b: w.config(bg=C['btn_hover']))
+            b.bind('<Leave>', lambda e, w=b: w.config(bg=C['btn_bg']))
+            b.pack(side=tk.LEFT, padx=4)
+
+        dlg.wait_window()
+        if result[0] is None:
+            return
+
+        idx = result[0] - 1   # 0-gebaseerde index in processor.parts
+        part = self.processor.parts[idx]
+
+        # Centreer het canvas op het zwaartepunt van het part
+        outers = part.outer_contours
+        if outers:
+            cx = sum(c.centroid[0] for c in outers) / len(outers)
+            cy = sum(c.centroid[1] for c in outers) / len(outers)
+            cw = self._canvas.winfo_width()
+            ch = self._canvas.winfo_height()
+            self._off_x = cw / 2 - cx * self._scale
+            self._off_y = ch / 2 + cy * self._scale
+
+        # Selecteer het part in wissel-modus
+        self._set_mode('swap')
+        self._sel_part = idx
+        self._update_swap_status()
+        self._redraw()
 
     def _set_mode(self, mode: str):
         """
@@ -1006,7 +1108,9 @@ class OrdViewer:
         p[idx_a], p[idx_b] = p[idx_b], p[idx_a]
         self._rebuild_display_rapids()
         self._dirty = True
-        self._sel_part = None
+        # Selecteer automatisch het part na de eerst-geselecteerde (idx_a)
+        next_idx = idx_a + 1
+        self._sel_part = next_idx if next_idx < len(self.processor.parts) else None
         self._update_swap_status()
         self._redraw()
 
@@ -1093,11 +1197,6 @@ class OrdViewer:
         dlg.configure(bg=C['bg'])
         dlg.grab_set()
 
-        self.root.update_idletasks()
-        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
-        rw, rh = self.root.winfo_width(), self.root.winfo_height()
-        dlg.geometry(f'340x230+{rx + rw//2 - 170}+{ry + rh//2 - 115}')
-
         tk.Label(dlg, text='Snijsnelheid (F5)',
                  bg=C['bg'], fg=C['text_bright'],
                  font=('Segoe UI', 10, 'bold')).pack(pady=(16, 4))
@@ -1138,6 +1237,17 @@ class OrdViewer:
         rb(sel_label, 'sel',
            state=tk.NORMAL if has_sel else tk.DISABLED).pack(anchor=tk.W)
 
+        # Lead-in/out optie
+        tk.Frame(dlg, bg='#2A2A50', height=1).pack(fill=tk.X, padx=12, pady=(10, 4))
+        leadin_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            dlg, text='Pas ook lead-in / lead-out aan  (F6=0)',
+            variable=leadin_var,
+            bg=C['bg'], fg=C['text_bright'], selectcolor=C['bg'],
+            activebackground=C['bg'], activeforeground=C['text_bright'],
+            font=('Segoe UI', 8)
+        ).pack(anchor=tk.W, padx=14)
+
         result = [None]
 
         def ok(_event=None):
@@ -1145,7 +1255,7 @@ class OrdViewer:
                 v = int(entry_var.get().strip())
                 if v <= 0:
                     raise ValueError
-                result[0] = (v, scope_var.get())
+                result[0] = (v, scope_var.get(), leadin_var.get())
                 dlg.destroy()
             except ValueError:
                 entry.config(bg='#4A1A1A')
@@ -1165,18 +1275,29 @@ class OrdViewer:
             b.bind('<Leave>', lambda e, w=b: w.config(bg=C['btn_bg']))
             b.pack(side=tk.LEFT, padx=4)
 
+        # Auto-sizing: centreer over hoofdvenster op basis van werkelijke maat
+        dlg.update_idletasks()
+        w = dlg.winfo_reqwidth()
+        h = dlg.winfo_reqheight()
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        dlg.geometry(f'{w}x{h}+{rx + (rw - w)//2}+{ry + (rh - h)//2}')
         dlg.wait_window()
 
         if result[0] is None:
             return
-        new_speed, scope = result[0]
+        new_speed, scope, include_leadin = result[0]
 
         if scope == 'sel' and has_sel:
-            # _speed_sel bevat contour.index waarden → geef door als contour_indices
             self.processor.apply_cutting_speed(
-                new_speed, contour_indices=list(self._speed_sel))
+                new_speed, contour_indices=list(self._speed_sel),
+                include_leadin=include_leadin)
         else:
-            self.processor.apply_cutting_speed(new_speed)
+            self.processor.apply_cutting_speed(
+                new_speed, include_leadin=include_leadin)
         self._set_mode('')   # sluit speed-modus + wist selectie + update knoppen
         self._speed_dirty = True
         self._update_swap_status()
